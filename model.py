@@ -30,7 +30,7 @@ np.random.seed(SEED)
 torch.manual_seed(SEED)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-DATASET_ROOT = Path(r"C:\Users\bryce\.cache\kagglehub\datasets\balraj98\massachusetts-roads-dataset\versions\1")
+DATASET_ROOT = Path(r"")
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 IMG_SIZE    = 512
@@ -38,7 +38,7 @@ BATCH_SIZE  = 8
 EPOCHS      = 50
 LR          = 1e-4
 CKPT_PATH   = Path("best_model.pth")
-# Windows uses 'spawn' for multiprocessing — num_workers=0 is faster here
+# MACOS workers
 NUM_WORKERS = 0 if os.name == "nt" else 4
 
 # ── Device ────────────────────────────────────────────────────────────────────
@@ -180,8 +180,6 @@ print(f"Avg road coverage: {masks.mean() * 100:.2f}%")
 # ── 6. Model Architecture ─────────────────────────────────────────────────────
 
 class DoubleConv(nn.Module):
-    """Conv2D → BN → ReLU → Conv2D → BN → ReLU"""
-
     def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
         self.net = nn.Sequential(
