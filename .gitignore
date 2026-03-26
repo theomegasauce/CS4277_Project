@@ -13,9 +13,10 @@ checkpoints/
 *.pt
 *.onnx
 
-# ── Training outputs ──
+# ── Training / evaluation outputs ──
 logs/
 !logs/.gitkeep
+evaluation_results/
 *.png
 training_history.png
 predictions.png
