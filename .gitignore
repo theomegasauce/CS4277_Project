@@ -1,0 +1,55 @@
+# ── Dataset files (regenerate with dataset/create_dataset.py) ──
+dataset/images/
+dataset/masks/
+dataset/splits/
+!dataset/images/.gitkeep
+!dataset/masks/.gitkeep
+!dataset/splits/.gitkeep
+
+# ── Model checkpoints ──
+checkpoints/
+!checkpoints/.gitkeep
+*.pth
+*.pt
+*.onnx
+
+# ── Training outputs ──
+logs/
+!logs/.gitkeep
+*.png
+training_history.png
+predictions.png
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ── Virtual environments ──
+.venv/
+venv/
+env/
+ENV/
+
+# ── Jupyter ──
+.ipynb_checkpoints/
+
+# ── IDE / editor ──
+.vscode/
+*.code-workspace
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS files ──
+Thumbs.db
+.DS_Store
+
+# ── Secrets (never commit) ──
+kaggle.json
+.env

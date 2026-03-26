@@ -1,0 +1,37 @@
+# ── Data ──────────────────────────────────────────────────────────────────────
+data:
+  dataset_root: "dataset"
+  img_size: 512
+  batch_size: 8
+  num_workers: 0        # 0 for Windows; set to 4+ on Linux
+  mean: [0.485, 0.456, 0.406]
+  std:  [0.229, 0.224, 0.225]
+  augmentation:
+    brightness: 0.2
+    contrast:   0.2
+    saturation: 0.1
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model:
+  in_channels: 3
+  encoder_channels: [32, 64, 128, 256]
+  lmcm_branch_ch: 64
+
+# ── Loss ──────────────────────────────────────────────────────────────────────
+loss:
+  dice_smooth: 1.0
+  edge_weight: 0.3
+  centerline_weight: 0.3
+
+# ── Training ──────────────────────────────────────────────────────────────────
+training:
+  epochs: 50
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  scheduler_eta_min: 1.0e-6
+  seed: 42
+  save_path: "checkpoints/best_model.pth"
+
+# ── Metrics ───────────────────────────────────────────────────────────────────
+metrics:
+  threshold: 0.5
