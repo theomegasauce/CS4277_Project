@@ -10,6 +10,7 @@ we are on the massechusets roads dataset
 
 here is the structure of the model so far
 
+```
 INPUT 512×512×3
        │
   ┌────▼────┐
@@ -57,3 +58,4 @@ INPUT 512×512×3
 SEG HEAD   EDGE HEAD  CL HEAD
 512×512×1  512×512×1  512×512×1
 (road mask)(edges)   (centerline)
+```
