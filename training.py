@@ -1,59 +1,55 @@
 """
-train.py — Training script for segmentation model.
+training.py — Train RoadSegNet on the Massachusetts Roads Dataset.
 
 Usage:
-    python train.py
-    python train.py --epochs 100 --lr 3e-4 --batch_size 4 --img_size 256
-    arguments listed in parse_arges() function below.
+    python training.py
+    python training.py --epochs 100 --lr 3e-4 --batch_size 4 --img_size 256
 """
 
-import os
+import argparse
 import random
 import time
-import argparse
 from pathlib import Path
 
-import yaml
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
+import yaml
 from tqdm import tqdm
 
-from src.dataset import build_loaders
-from src.model import RoadSegNet
-from src.losses import total_loss, make_edge_targets, make_centerline_targets
-from src.metrics import iou_score, dice_score, precision_score, recall_score, f1_score, accuracy_score
+from model1 import (
+    RoadSegNet,
+    build_loaders,
+    iou_score,
+    make_centerline_targets,
+    make_edge_targets,
+    total_loss,
+)
 
 
-# ── CLI arguments ────────────────────────────────────────────────────────────
+# ── Config / CLI ─────────────────────────────────────────────────────────────
 
 def load_config(path: str = "config.yaml") -> dict:
-    """Load YAML config file and return as nested dict."""
     with open(path, "r") as f:
         return yaml.safe_load(f)
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Train RoadSegNet on Massachusetts Roads")
-    p.add_argument("--config",      type=str,   default="config.yaml",
-                   help="Path to YAML config file (default: config.yaml)")
-    # CLI overrides — any flag set here takes priority over config.yaml
+    p.add_argument("--config",       type=str,   default="config.yaml")
     p.add_argument("--dataset_root", type=str,   default=None)
-    p.add_argument("--img_size",    type=int,   default=None)
-    p.add_argument("--batch_size",  type=int,   default=None)
-    p.add_argument("--epochs",      type=int,   default=None)
-    p.add_argument("--lr",          type=float, default=None)
-    p.add_argument("--weight_decay",type=float, default=None)
-    p.add_argument("--seed",        type=int,   default=None)
-    p.add_argument("--save_path",   type=str,   default=None,
-                   help="Where to save the best checkpoint (written during training, not loaded)")
-    p.add_argument("--resume",      type=str,   default=None,
-                   help="Path to checkpoint to resume training from (e.g. best_model.pth)")
-    p.add_argument("--num_workers", type=int,   default=None)
+    p.add_argument("--img_size",     type=int,   default=None)
+    p.add_argument("--batch_size",   type=int,   default=None)
+    p.add_argument("--epochs",       type=int,   default=None)
+    p.add_argument("--lr",           type=float, default=None)
+    p.add_argument("--weight_decay", type=float, default=None)
+    p.add_argument("--seed",         type=int,   default=None)
+    p.add_argument("--save_path",    type=str,   default=None)
+    p.add_argument("--resume",       type=str,   default=None,
+                   help="Path to checkpoint to resume training from")
+    p.add_argument("--num_workers",  type=int,   default=None)
     return p.parse_args()
 
-
-# ── Reproducibility ──────────────────────────────────────────────────────────
 
 def seed_everything(seed: int):
     random.seed(seed)
@@ -63,7 +59,18 @@ def seed_everything(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
-# ── Training & validation steps ──────────────────────────────────────────────
+def next_checkpoint_path(base: Path) -> Path:
+    """Return the next unused `{stem}_v{N}{suffix}` alongside `base`."""
+    base.parent.mkdir(parents=True, exist_ok=True)
+    n = 1
+    while True:
+        candidate = base.parent / f"{base.stem}_v{n}{base.suffix}"
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+# ── Training / validation loops ──────────────────────────────────────────────
 
 def train_one_epoch(model, loader, optimizer, scaler, device, epoch,
                     edge_weight=0.3, centerline_weight=0.3, dice_smooth=1.0):
@@ -134,32 +141,6 @@ def validate(model, loader, device, epoch,
     return total_loss_val / n, total_iou / n
 
 
-# ── Test evaluation ──────────────────────────────────────────────────────────
-
-@torch.no_grad()
-def evaluate_test(model, loader, device):
-    model.eval()
-    agg = {"iou": 0.0, "dice": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0, "accuracy": 0.0}
-
-    pbar = tqdm(loader, desc="  Test eval", leave=False, unit="batch", dynamic_ncols=True)
-    for imgs, masks in pbar:
-        imgs  = imgs.to(device, non_blocking=True)
-        masks = masks.to(device, non_blocking=True)
-
-        with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-            p_seg, _, _ = model(imgs)
-
-        agg["iou"]       += iou_score(p_seg, masks)
-        agg["dice"]      += dice_score(p_seg, masks)
-        agg["precision"] += precision_score(p_seg, masks)
-        agg["recall"]    += recall_score(p_seg, masks)
-        agg["f1"]        += f1_score(p_seg, masks)
-        agg["accuracy"]  += accuracy_score(p_seg, masks)
-
-    n = len(loader)
-    return {k: v / n for k, v in agg.items()}
-
-
 # ── Plotting ─────────────────────────────────────────────────────────────────
 
 def plot_history(history, save_path="training_history.png"):
@@ -178,7 +159,7 @@ def plot_history(history, save_path="training_history.png"):
     plt.suptitle("Training History", fontsize=13)
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
-    plt.show()
+    plt.close()
     print(f"Plot saved to {save_path}")
 
 
@@ -188,7 +169,6 @@ def main():
     args = parse_args()
     cfg  = load_config(args.config)
 
-    # ── Merge: CLI overrides take priority over config.yaml ───────────────
     data_cfg  = cfg["data"]
     model_cfg = cfg["model"]
     loss_cfg  = cfg["loss"]
@@ -202,7 +182,11 @@ def main():
     epochs       = args.epochs      or train_cfg["epochs"]
     lr           = args.lr          or train_cfg["lr"]
     weight_decay = args.weight_decay or train_cfg["weight_decay"]
-    save_path    = Path(args.save_path or train_cfg["save_path"])
+    base_save_path = Path(args.save_path or train_cfg["save_path"])
+    # When resuming, keep writing to the resumed file; otherwise allocate a new
+    # numbered file so each run's best checkpoint is preserved.
+    save_path = (Path(args.resume) if args.resume is not None
+                 else next_checkpoint_path(base_save_path))
 
     seed_everything(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -212,10 +196,11 @@ def main():
     if device.type == "cuda":
         print(f"GPU         : {torch.cuda.get_device_name(0)}")
     print(f"Dataset root: {dataset_root}")
+    print(f"Checkpoint  : {save_path}")
 
     # ── Data ──────────────────────────────────────────────────────────────
     aug_cfg = data_cfg.get("augmentation", {})
-    train_loader, val_loader, test_loader = build_loaders(
+    train_loader, val_loader, _ = build_loaders(
         dataset_root,
         img_size=img_size,
         batch_size=batch_size,
@@ -229,7 +214,6 @@ def main():
     )
     print(f"\nTrain : {len(train_loader.dataset):>5} images -> {len(train_loader):>4} batches (augmented)")
     print(f"Val   : {len(val_loader.dataset):>5} images -> {len(val_loader):>4} batches")
-    print(f"Test  : {len(test_loader.dataset):>5} images -> {len(test_loader):>4} batches")
 
     # ── Model ─────────────────────────────────────────────────────────────
     model = RoadSegNet(
@@ -245,7 +229,7 @@ def main():
         optimizer, T_max=epochs, eta_min=train_cfg.get("scheduler_eta_min", 1e-6))
     scaler    = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
-    # ── Resume from checkpoint ───────────────────────────────────────────
+    # ── Resume from checkpoint ────────────────────────────────────────────
     start_epoch = 1
     best_iou    = 0.0
     history     = {"train_loss": [], "val_loss": [], "val_iou": []}
@@ -270,7 +254,6 @@ def main():
 
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # ── Loss weights from config ─────────────────────────────────────────
     edge_w       = loss_cfg.get("edge_weight", 0.3)
     centerline_w = loss_cfg.get("centerline_weight", 0.3)
     dice_smooth  = loss_cfg.get("dice_smooth", 1.0)
@@ -320,20 +303,6 @@ def main():
     print(f"\nTraining complete in {elapsed / 60:.1f} min")
     print(f"Best val IoU: {best_iou:.4f}  ->  {save_path}")
 
-    # ── Test evaluation ───────────────────────────────────────────────────
-    print("\nLoading best checkpoint for test evaluation ...")
-    ckpt = torch.load(save_path, map_location=device, weights_only=True)
-    model.load_state_dict(ckpt["model"])
-
-    test_metrics = evaluate_test(model, test_loader, device)
-    print("\n" + "=" * 40)
-    print("  Test Set Metrics")
-    print("=" * 40)
-    for name, value in test_metrics.items():
-        print(f"  {name:<12s}: {value:.4f}")
-    print("=" * 40)
-
-    # ── Plots ─────────────────────────────────────────────────────────────
     plot_history(history)
 
 

@@ -1,29 +1,35 @@
 """
-evaluation.py — Standalone evaluation script for a trained RoadSegNet checkpoint.
+testing.py — Evaluate a trained RoadSegNet checkpoint on the test set.
 
-Loads the best model, runs it on the test set, computes all metrics,
-generates visual predictions, and prints a full report.
+Prints test metrics, saves a report, and writes visualizations
+(predictions grid, metric distributions, confusion matrix) to a folder.
 
 Usage:
-    python evaluation.py
-    python evaluation.py --checkpoint checkpoints/best_model.pth
-    python evaluation.py --config config.yaml --num_samples 8
+    python testing.py
+    python testing.py --checkpoint checkpoints/best_model.pth
+    python testing.py --config config.yaml --num_samples 8 --save_dir evaluation_results
 """
 
 import argparse
 import random
 from pathlib import Path
 
-import yaml
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
+import yaml
 from tqdm import tqdm
 
-from src.dataset import build_loaders, MassRoadsDataset
-from src.model import RoadSegNet
-from src.metrics import (
-    iou_score, dice_score, precision_score, recall_score, f1_score, accuracy_score,
+from model1 import (
+    MassRoadsDataset,
+    RoadSegNet,
+    accuracy_score,
+    build_loaders,
+    dice_score,
+    f1_score,
+    iou_score,
+    precision_score,
+    recall_score,
 )
 
 
@@ -46,8 +52,6 @@ def parse_args():
     return p.parse_args()
 
 
-# ── Reproducibility ─────────────────────────────────────────────────────────
-
 def seed_everything(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -56,7 +60,7 @@ def seed_everything(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
-# ── Per-batch metric collection ─────────────────────────────────────────────
+# ── Metrics collection ──────────────────────────────────────────────────────
 
 @torch.no_grad()
 def evaluate_test(model, loader, device, threshold=0.5):
@@ -70,7 +74,6 @@ def evaluate_test(model, loader, device, threshold=0.5):
         "F1":        lambda p, t: f1_score(p, t, threshold),
         "Accuracy":  lambda p, t: accuracy_score(p, t, threshold),
     }
-
     per_batch = {k: [] for k in metric_fns}
 
     pbar = tqdm(loader, desc="  Test eval", leave=False, unit="batch", dynamic_ncols=True)
@@ -84,11 +87,9 @@ def evaluate_test(model, loader, device, threshold=0.5):
         for name, fn in metric_fns.items():
             per_batch[name].append(fn(p_seg, masks))
 
-    aggregated = {k: np.mean(v) for k, v in per_batch.items()}
+    aggregated = {k: float(np.mean(v)) for k, v in per_batch.items()}
     return aggregated, per_batch
 
-
-# ── Confusion matrix components (dataset-wide) ─────────────────────────────
 
 @torch.no_grad()
 def compute_confusion(model, loader, device, threshold=0.5):
@@ -124,10 +125,9 @@ def compute_confusion(model, loader, device, threshold=0.5):
 
 @torch.no_grad()
 def visualize_predictions(model, loader, device, num_samples, save_path, threshold=0.5):
-    """Save a grid of (image, ground truth, prediction, overlay) for random test samples."""
+    """Save a grid of (image, ground truth, prediction, overlay) for random samples."""
     model.eval()
 
-    # Collect all test images/masks/preds
     all_imgs, all_masks, all_preds = [], [], []
     for imgs, masks in loader:
         imgs  = imgs.to(device, non_blocking=True)
@@ -155,7 +155,6 @@ def visualize_predictions(model, loader, device, num_samples, save_path, thresho
         gt   = all_masks[idx, 0].numpy()
         pred = all_preds[idx, 0].numpy()
 
-        # Overlay: green = TP, red = FN, blue = FP
         overlay = img.copy()
         tp_mask = (pred == 1) & (gt == 1)
         fn_mask = (pred == 0) & (gt == 1)
@@ -164,15 +163,10 @@ def visualize_predictions(model, loader, device, num_samples, save_path, thresho
         overlay[fn_mask] = [1, 0, 0]
         overlay[fp_mask] = [0, 0, 1]
 
-        axes[row, 0].imshow(img)
-        axes[row, 0].set_title("Input Image")
-        axes[row, 1].imshow(gt, cmap="gray")
-        axes[row, 1].set_title("Ground Truth")
-        axes[row, 2].imshow(pred, cmap="gray")
-        axes[row, 2].set_title("Prediction")
-        axes[row, 3].imshow(overlay)
-        axes[row, 3].set_title("Overlay (G=TP R=FN B=FP)")
-
+        axes[row, 0].imshow(img);      axes[row, 0].set_title("Input Image")
+        axes[row, 1].imshow(gt, cmap="gray");   axes[row, 1].set_title("Ground Truth")
+        axes[row, 2].imshow(pred, cmap="gray"); axes[row, 2].set_title("Prediction")
+        axes[row, 3].imshow(overlay);  axes[row, 3].set_title("Overlay (G=TP R=FN B=FP)")
         for ax in axes[row]:
             ax.axis("off")
 
@@ -263,7 +257,7 @@ def main():
     print(f"  Save dir   : {save_dir}")
     print()
 
-    # ── Load data ─────────────────────────────────────────────────────────
+    # ── Data ──────────────────────────────────────────────────────────────
     aug_cfg = data_cfg.get("augmentation", {})
     _, _, test_loader = build_loaders(
         dataset_root,
@@ -277,10 +271,9 @@ def main():
         contrast=aug_cfg.get("contrast", 0.2),
         saturation=aug_cfg.get("saturation", 0.1),
     )
-    print(f"  Test set: {len(test_loader.dataset)} images, {len(test_loader)} batches")
-    print()
+    print(f"  Test set: {len(test_loader.dataset)} images, {len(test_loader)} batches\n")
 
-    # ── Load model ────────────────────────────────────────────────────────
+    # ── Model ─────────────────────────────────────────────────────────────
     model = RoadSegNet(
         in_channels=model_cfg.get("in_channels", 3),
         encoder_channels=model_cfg.get("encoder_channels"),
@@ -299,7 +292,7 @@ def main():
           + (f", val IoU {val_iou:.4f}" if val_iou else ""))
     print()
 
-    # ── Aggregate metrics ─────────────────────────────────────────────────
+    # ── Metrics ───────────────────────────────────────────────────────────
     print("Computing test metrics ...")
     aggregated, per_batch = evaluate_test(model, test_loader, device, threshold)
 
@@ -312,7 +305,6 @@ def main():
     print("=" * 40)
     print()
 
-    # ── Global confusion matrix metrics ───────────────────────────────────
     print("Computing pixel-level confusion matrix ...")
     confusion = compute_confusion(model, test_loader, device, threshold)
 
@@ -324,7 +316,7 @@ def main():
     print(f"  FP: {confusion['FP']:>14,}")
     print(f"  FN: {confusion['FN']:>14,}")
     print(f"  TN: {confusion['TN']:>14,}")
-    print(f"  {'─' * 36}")
+    print(f"  {'-' * 36}")
     print(f"  Global Precision : {confusion['Global Precision']:.4f}")
     print(f"  Global Recall    : {confusion['Global Recall']:.4f}")
     print(f"  Global F1        : {confusion['Global F1']:.4f}")
@@ -333,7 +325,7 @@ def main():
     print("=" * 40)
     print()
 
-    # ── Plots ─────────────────────────────────────────────────────────────
+    # ── Visualizations ────────────────────────────────────────────────────
     print("Generating visualizations ...")
     visualize_predictions(
         model, test_loader, device, args.num_samples,
@@ -343,10 +335,10 @@ def main():
     plot_confusion_matrix(
         confusion, save_path=save_dir / "confusion_matrix.png")
 
-    # ── Save metrics to text file ─────────────────────────────────────────
+    # ── Text report ───────────────────────────────────────────────────────
     report_path = save_dir / "metrics_report.txt"
     with open(report_path, "w") as f:
-        f.write(f"RoadSegNet Evaluation Report\n")
+        f.write("RoadSegNet Evaluation Report\n")
         f.write(f"Checkpoint: {checkpoint}\n")
         f.write(f"Epoch:      {epoch}\n")
         f.write(f"Threshold:  {threshold}\n")
@@ -357,7 +349,7 @@ def main():
         for name, value in aggregated.items():
             f.write(f"  {name:<12s}: {value:.4f}\n")
 
-        f.write(f"\nPixel-Level Confusion Stats\n")
+        f.write("\nPixel-Level Confusion Stats\n")
         f.write("-" * 30 + "\n")
         f.write(f"  TP: {confusion['TP']:>14,}\n")
         f.write(f"  FP: {confusion['FP']:>14,}\n")
