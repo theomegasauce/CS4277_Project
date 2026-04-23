@@ -12,16 +12,34 @@ data:
     saturation: 0.1
 
 # ── Model ─────────────────────────────────────────────────────────────────────
+# Set `name` to "v1" (RoadSegNet) or "v2" (RoadSegNetV2, structure-aware).
 model:
-  in_channels: 3
-  encoder_channels: [32, 64, 128, 256]
-  lmcm_branch_ch: 64
+  name: "v2"
+
+  v1:
+    in_channels: 3
+    encoder_channels: [32, 64, 128, 256]
+    lmcm_branch_ch: 64
+
+  v2:
+    in_channels: 3
+    encoder_channels:  [64,  64, 128, 256]
+    decoder_channels:  [128, 64, 32,  32]
+    compress_channels: [64,  32, 32,  32]
+    lmcm_branch_ch: 64
 
 # ── Loss ──────────────────────────────────────────────────────────────────────
 loss:
   dice_smooth: 1.0
-  edge_weight: 0.3
-  centerline_weight: 0.3
+
+  v1:
+    edge_weight: 0.3
+    centerline_weight: 0.3
+
+  v2:
+    edge_weight: 0.25
+    centerline_weight: 0.5
+    aux_weight: 0.2
 
 # ── Training ──────────────────────────────────────────────────────────────────
 training:

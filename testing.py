@@ -1,5 +1,10 @@
 """
-testing.py — Evaluate a trained RoadSegNet checkpoint on the test set.
+testing.py — Evaluate a trained RoadSegNet (v1) or RoadSegNetV2 (v2) checkpoint.
+
+The model variant is resolved in this order:
+  1. --model CLI flag
+  2. `model_name` stored in the checkpoint
+  3. `model.name` in config.yaml
 
 Prints test metrics, saves a report, and writes visualizations
 (predictions grid, metric distributions, confusion matrix) to a folder.
@@ -7,6 +12,7 @@ Prints test metrics, saves a report, and writes visualizations
 Usage:
     python testing.py
     python testing.py --checkpoint checkpoints/best_model.pth
+    python testing.py --model v2 --checkpoint checkpoints/best_model_v2.pth
     python testing.py --config config.yaml --num_samples 8 --save_dir evaluation_results
 """
 
@@ -22,7 +28,6 @@ from tqdm import tqdm
 
 from model1 import (
     MassRoadsDataset,
-    RoadSegNet,
     accuracy_score,
     build_loaders,
     dice_score,
@@ -43,6 +48,8 @@ def load_config(path: str = "config.yaml") -> dict:
 def parse_args():
     p = argparse.ArgumentParser(description="Evaluate a trained RoadSegNet checkpoint")
     p.add_argument("--config",      type=str, default="config.yaml")
+    p.add_argument("--model",       type=str, default=None, choices=["v1", "v2"],
+                   help="Override model variant (default: from checkpoint or config)")
     p.add_argument("--checkpoint",  type=str, default=None,
                    help="Path to .pth checkpoint (default: from config training.save_path)")
     p.add_argument("--num_samples", type=int, default=6,
@@ -58,6 +65,38 @@ def seed_everything(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+# ── Model dispatch ──────────────────────────────────────────────────────────
+
+def build_model(model_name: str, model_cfg: dict) -> torch.nn.Module:
+    name = model_name.lower()
+    if name == "v1":
+        from model1 import RoadSegNet
+        mc = model_cfg.get("v1", {})
+        return RoadSegNet(
+            in_channels      = mc.get("in_channels", 3),
+            encoder_channels = mc.get("encoder_channels"),
+            lmcm_branch_ch   = mc.get("lmcm_branch_ch", 64),
+        )
+    if name == "v2":
+        from model2 import RoadSegNetV2
+        mc = model_cfg.get("v2", {})
+        return RoadSegNetV2(
+            in_channels       = mc.get("in_channels", 3),
+            encoder_channels  = mc.get("encoder_channels"),
+            decoder_channels  = mc.get("decoder_channels"),
+            compress_channels = mc.get("compress_channels"),
+            lmcm_branch_ch    = mc.get("lmcm_branch_ch", 64),
+        )
+    raise ValueError(f"Unknown model name: {name!r} (expected 'v1' or 'v2')")
+
+
+def seg_logits_from(outputs):
+    """Extract seg logits from v1 (tuple) or v2 (dict) model output."""
+    if isinstance(outputs, dict):
+        return outputs["seg"]
+    return outputs[0]
 
 
 # ── Metrics collection ──────────────────────────────────────────────────────
@@ -82,7 +121,8 @@ def evaluate_test(model, loader, device, threshold=0.5):
         masks = masks.to(device, non_blocking=True)
 
         with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-            p_seg, _, _ = model(imgs)
+            outputs = model(imgs)
+        p_seg = seg_logits_from(outputs)
 
         for name, fn in metric_fns.items():
             per_batch[name].append(fn(p_seg, masks))
@@ -102,7 +142,8 @@ def compute_confusion(model, loader, device, threshold=0.5):
         masks = masks.to(device, non_blocking=True)
 
         with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-            p_seg, _, _ = model(imgs)
+            outputs = model(imgs)
+        p_seg = seg_logits_from(outputs)
 
         pred = (torch.sigmoid(p_seg) > threshold).float()
         tp += (pred * masks).sum().item()
@@ -133,7 +174,8 @@ def visualize_predictions(model, loader, device, num_samples, save_path, thresho
         imgs  = imgs.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
         with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-            p_seg, _, _ = model(imgs)
+            outputs = model(imgs)
+        p_seg = seg_logits_from(outputs)
         pred = (torch.sigmoid(p_seg) > threshold).float()
         all_imgs.append(imgs.cpu())
         all_masks.append(masks.cpu())
@@ -247,11 +289,23 @@ def main():
     save_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    if not checkpoint.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
+    ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
+
+    # Resolve model variant: CLI → checkpoint → config
+    model_name = (args.model
+                  or ckpt.get("model_name")
+                  or model_cfg.get("name", "v1")).lower()
+    model_label = {"v1": "RoadSegNet (v1)", "v2": "RoadSegNetV2 (v2)"}.get(
+        model_name, f"Unknown ({model_name})")
+
     print("=" * 50)
-    print("  RoadSegNet — Evaluation")
+    print(f"  {model_label} — Evaluation")
     print("=" * 50)
     print(f"  Config     : {args.config}")
     print(f"  Checkpoint : {checkpoint}")
+    print(f"  Model      : {model_name}")
     print(f"  Device     : {device}")
     print(f"  Threshold  : {threshold}")
     print(f"  Save dir   : {save_dir}")
@@ -274,16 +328,7 @@ def main():
     print(f"  Test set: {len(test_loader.dataset)} images, {len(test_loader)} batches\n")
 
     # ── Model ─────────────────────────────────────────────────────────────
-    model = RoadSegNet(
-        in_channels=model_cfg.get("in_channels", 3),
-        encoder_channels=model_cfg.get("encoder_channels"),
-        lmcm_branch_ch=model_cfg.get("lmcm_branch_ch", 64),
-    ).to(device)
-
-    if not checkpoint.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
-
-    ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
+    model = build_model(model_name, model_cfg).to(device)
     model.load_state_dict(ckpt["model"])
     epoch   = ckpt.get("epoch", "?")
     val_iou = ckpt.get("val_iou", None)
@@ -338,8 +383,9 @@ def main():
     # ── Text report ───────────────────────────────────────────────────────
     report_path = save_dir / "metrics_report.txt"
     with open(report_path, "w") as f:
-        f.write("RoadSegNet Evaluation Report\n")
+        f.write(f"{model_label} — Evaluation Report\n")
         f.write(f"Checkpoint: {checkpoint}\n")
+        f.write(f"Model:      {model_name}\n")
         f.write(f"Epoch:      {epoch}\n")
         f.write(f"Threshold:  {threshold}\n")
         f.write(f"Test size:  {len(test_loader.dataset)} images\n\n")

@@ -1,8 +1,11 @@
 """
-training.py — Train RoadSegNet on the Massachusetts Roads Dataset.
+training.py — Train RoadSegNet (v1) or RoadSegNetV2 (v2) on the Massachusetts Roads Dataset.
+
+The active model is selected via `model.name` in config.yaml ("v1" or "v2").
 
 Usage:
     python training.py
+    python training.py --model v2
     python training.py --epochs 100 --lr 3e-4 --batch_size 4 --img_size 256
 """
 
@@ -17,13 +20,12 @@ import torch
 import yaml
 from tqdm import tqdm
 
+# Shared data / target / metric utilities — identical between model1 and model2.
 from model1 import (
-    RoadSegNet,
     build_loaders,
     iou_score,
     make_centerline_targets,
     make_edge_targets,
-    total_loss,
 )
 
 
@@ -37,6 +39,8 @@ def load_config(path: str = "config.yaml") -> dict:
 def parse_args():
     p = argparse.ArgumentParser(description="Train RoadSegNet on Massachusetts Roads")
     p.add_argument("--config",       type=str,   default="config.yaml")
+    p.add_argument("--model",        type=str,   default=None, choices=["v1", "v2"],
+                   help="Override model.name in the config")
     p.add_argument("--dataset_root", type=str,   default=None)
     p.add_argument("--img_size",     type=int,   default=None)
     p.add_argument("--batch_size",   type=int,   default=None)
@@ -70,49 +74,115 @@ def next_checkpoint_path(base: Path) -> Path:
         n += 1
 
 
+# ── Model / loss dispatch ────────────────────────────────────────────────────
+
+def build_model(model_cfg: dict) -> tuple[str, torch.nn.Module]:
+    name = model_cfg.get("name", "v1").lower()
+    if name == "v1":
+        from model1 import RoadSegNet
+        mc = model_cfg.get("v1", {})
+        model = RoadSegNet(
+            in_channels      = mc.get("in_channels", 3),
+            encoder_channels = mc.get("encoder_channels"),
+            lmcm_branch_ch   = mc.get("lmcm_branch_ch", 64),
+        )
+    elif name == "v2":
+        from model2 import RoadSegNetV2
+        mc = model_cfg.get("v2", {})
+        model = RoadSegNetV2(
+            in_channels       = mc.get("in_channels", 3),
+            encoder_channels  = mc.get("encoder_channels"),
+            decoder_channels  = mc.get("decoder_channels"),
+            compress_channels = mc.get("compress_channels"),
+            lmcm_branch_ch    = mc.get("lmcm_branch_ch", 64),
+        )
+    else:
+        raise ValueError(f"Unknown model.name: {name!r} (expected 'v1' or 'v2')")
+    return name, model
+
+
+def make_loss_fn(model_name: str, loss_cfg: dict):
+    """
+    Returns a callable `(outputs, masks, t_edge, t_cl) -> (loss, comps)`.
+
+    Also returns (seg_logits_fn, component_keys) so callers can adapt to the
+    different output shapes of v1 (tuple) and v2 (dict) without branching.
+    """
+    dice_smooth = loss_cfg.get("dice_smooth", 1.0)
+
+    if model_name == "v1":
+        from model1 import total_loss as total_loss_v1
+        lc     = loss_cfg.get("v1", {})
+        edge_w = lc.get("edge_weight", 0.3)
+        cl_w   = lc.get("centerline_weight", 0.3)
+
+        def compute(outputs, masks, t_edge, t_cl):
+            p_seg, p_edge, p_cl = outputs
+            return total_loss_v1(p_seg, p_edge, p_cl, masks, t_edge, t_cl,
+                                 edge_weight=edge_w, centerline_weight=cl_w,
+                                 dice_smooth=dice_smooth)
+
+        def seg_logits(outputs):
+            return outputs[0]
+
+        display_keys = ["loss/seg", "loss/edge", "loss/centerline"]
+        return compute, seg_logits, display_keys
+
+    if model_name == "v2":
+        from model2 import total_loss as total_loss_v2
+        lc      = loss_cfg.get("v2", {})
+        edge_w  = lc.get("edge_weight", 0.25)
+        cl_w    = lc.get("centerline_weight", 0.5)
+        aux_w   = lc.get("aux_weight", 0.2)
+
+        def compute(outputs, masks, t_edge, t_cl):
+            return total_loss_v2(outputs, masks, t_edge, t_cl,
+                                 edge_weight=edge_w, centerline_weight=cl_w,
+                                 aux_weight=aux_w, dice_smooth=dice_smooth)
+
+        def seg_logits(outputs):
+            return outputs["seg"]
+
+        display_keys = ["loss/road", "loss/edge", "loss/centerline", "loss/aux"]
+        return compute, seg_logits, display_keys
+
+    raise ValueError(f"Unknown model name: {model_name!r}")
+
+
 # ── Training / validation loops ──────────────────────────────────────────────
 
-def train_one_epoch(model, loader, optimizer, scaler, device, epoch,
-                    edge_weight=0.3, centerline_weight=0.3, dice_smooth=1.0):
+def train_one_epoch(model, loader, optimizer, scaler, device, epoch, loss_fn):
     model.train()
-    totals = {"loss/total": 0.0, "loss/seg": 0.0, "loss/edge": 0.0, "loss/centerline": 0.0}
+    totals: dict[str, float] = {}
 
     pbar = tqdm(loader, desc=f"  Epoch {epoch:3d} train", leave=False,
                 unit="batch", dynamic_ncols=True)
     for imgs, masks in pbar:
-        imgs  = imgs.to(device, non_blocking=True)
-        masks = masks.to(device, non_blocking=True)
+        imgs   = imgs.to(device, non_blocking=True)
+        masks  = masks.to(device, non_blocking=True)
         t_edge = make_edge_targets(masks)
         t_cl   = make_centerline_targets(masks)
 
         optimizer.zero_grad()
         with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-            p_seg, p_edge, p_cl = model(imgs)
-            loss, comps = total_loss(p_seg, p_edge, p_cl, masks, t_edge, t_cl,
-                                     edge_weight=edge_weight,
-                                     centerline_weight=centerline_weight,
-                                     dice_smooth=dice_smooth)
+            outputs     = model(imgs)
+            loss, comps = loss_fn(outputs, masks, t_edge, t_cl)
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
 
-        for k in totals:
-            totals[k] += comps[k]
+        for k, v in comps.items():
+            totals[k] = totals.get(k, 0.0) + v
 
-        pbar.set_postfix(
-            loss=f"{comps['loss/total']:.3f}",
-            seg=f"{comps['loss/seg']:.3f}",
-            edge=f"{comps['loss/edge']:.3f}",
-        )
+        pbar.set_postfix(loss=f"{comps['loss/total']:.3f}")
 
     n = len(loader)
     return {k: v / n for k, v in totals.items()}
 
 
 @torch.no_grad()
-def validate(model, loader, device, epoch,
-             edge_weight=0.3, centerline_weight=0.3, dice_smooth=1.0):
+def validate(model, loader, device, epoch, loss_fn, seg_logits_fn):
     model.eval()
     total_loss_val = 0.0
     total_iou      = 0.0
@@ -120,19 +190,16 @@ def validate(model, loader, device, epoch,
     pbar = tqdm(loader, desc=f"  Epoch {epoch:3d}   val", leave=False,
                 unit="batch", dynamic_ncols=True)
     for imgs, masks in pbar:
-        imgs  = imgs.to(device, non_blocking=True)
-        masks = masks.to(device, non_blocking=True)
+        imgs   = imgs.to(device, non_blocking=True)
+        masks  = masks.to(device, non_blocking=True)
         t_edge = make_edge_targets(masks)
         t_cl   = make_centerline_targets(masks)
 
         with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-            p_seg, p_edge, p_cl = model(imgs)
-            _, comps = total_loss(p_seg, p_edge, p_cl, masks, t_edge, t_cl,
-                                  edge_weight=edge_weight,
-                                  centerline_weight=centerline_weight,
-                                  dice_smooth=dice_smooth)
+            outputs  = model(imgs)
+            _, comps = loss_fn(outputs, masks, t_edge, t_cl)
 
-        batch_iou = iou_score(p_seg, masks)
+        batch_iou = iou_score(seg_logits_fn(outputs), masks)
         total_loss_val += comps["loss/total"]
         total_iou      += batch_iou
         pbar.set_postfix(loss=f"{comps['loss/total']:.3f}", iou=f"{batch_iou:.3f}")
@@ -173,6 +240,9 @@ def main():
     model_cfg = cfg["model"]
     loss_cfg  = cfg["loss"]
     train_cfg = cfg["training"]
+
+    if args.model is not None:
+        model_cfg["name"] = args.model
 
     dataset_root = Path(args.dataset_root or data_cfg["dataset_root"])
     img_size     = args.img_size    or data_cfg["img_size"]
@@ -216,13 +286,13 @@ def main():
     print(f"Val   : {len(val_loader.dataset):>5} images -> {len(val_loader):>4} batches")
 
     # ── Model ─────────────────────────────────────────────────────────────
-    model = RoadSegNet(
-        in_channels=model_cfg.get("in_channels", 3),
-        encoder_channels=model_cfg.get("encoder_channels"),
-        lmcm_branch_ch=model_cfg.get("lmcm_branch_ch", 64),
-    ).to(device)
+    model_name, model = build_model(model_cfg)
+    model = model.to(device)
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"\nRoadSegNet — {total_params:,} parameters")
+    model_label = {"v1": "RoadSegNet (v1)", "v2": "RoadSegNetV2 (v2)"}[model_name]
+    print(f"\n{model_label} — {total_params:,} parameters")
+
+    loss_fn, seg_logits_fn, display_keys = make_loss_fn(model_name, loss_cfg)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -240,6 +310,11 @@ def main():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
         print(f"\nResuming from {resume_path} ...")
         ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        if ckpt.get("model_name", model_name) != model_name:
+            raise ValueError(
+                f"Checkpoint was trained with model={ckpt.get('model_name')}, "
+                f"but current config specifies model={model_name}."
+            )
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         if "scheduler" in ckpt:
@@ -254,22 +329,20 @@ def main():
 
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
-    edge_w       = loss_cfg.get("edge_weight", 0.3)
-    centerline_w = loss_cfg.get("centerline_weight", 0.3)
-    dice_smooth  = loss_cfg.get("dice_smooth", 1.0)
-
     # ── Training loop ─────────────────────────────────────────────────────
-    print(f"\nTraining RoadSegNet — epochs {start_epoch}..{epochs} on {device}")
-    header = f"{'Epoch':>7}  {'Train Loss':>10}  {'Seg':>6}  {'Edge':>6}  {'CL':>6}  {'Val Loss':>9}  {'Val IoU':>8}"
+    print(f"\nTraining {model_label} — epochs {start_epoch}..{epochs} on {device}")
+    short = {"loss/seg": "Seg", "loss/road": "Road", "loss/edge": "Edge",
+             "loss/centerline": "CL", "loss/aux": "Aux"}
+    comp_cols = "  ".join(f"{short[k]:>6}" for k in display_keys)
+    header = f"{'Epoch':>7}  {'Train Loss':>10}  {comp_cols}  {'Val Loss':>9}  {'Val IoU':>8}"
     print(header)
     print("-" * len(header))
 
     t_start = time.time()
     epoch_bar = tqdm(range(start_epoch, epochs + 1), desc="Training", unit="epoch", dynamic_ncols=True)
     for epoch in epoch_bar:
-        loss_kwargs = dict(edge_weight=edge_w, centerline_weight=centerline_w, dice_smooth=dice_smooth)
-        train_comps       = train_one_epoch(model, train_loader, optimizer, scaler, device, epoch, **loss_kwargs)
-        val_loss, val_iou = validate(model, val_loader, device, epoch, **loss_kwargs)
+        train_comps       = train_one_epoch(model, train_loader, optimizer, scaler, device, epoch, loss_fn)
+        val_loss, val_iou = validate(model, val_loader, device, epoch, loss_fn, seg_logits_fn)
         scheduler.step()
 
         history["train_loss"].append(train_comps["loss/total"])
@@ -281,6 +354,7 @@ def main():
             best_iou = val_iou
             torch.save({
                 "epoch": epoch,
+                "model_name": model_name,
                 "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
@@ -290,11 +364,10 @@ def main():
             }, save_path)
 
         epoch_bar.set_postfix(val_iou=f"{val_iou:.4f}", best=f"{best_iou:.4f}")
+        comp_vals = "  ".join(f"{train_comps.get(k, 0.0):6.3f}" for k in display_keys)
         tqdm.write(
             f"{epoch:7d}  {train_comps['loss/total']:10.4f}  "
-            f"{train_comps['loss/seg']:6.3f}  "
-            f"{train_comps['loss/edge']:6.3f}  "
-            f"{train_comps['loss/centerline']:6.3f}  "
+            f"{comp_vals}  "
             f"{val_loss:9.4f}  {val_iou:8.4f}"
             + ("  *" if improved else "")
         )

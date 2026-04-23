@@ -17,6 +17,7 @@ checkpoints/
 logs/
 !logs/.gitkeep
 evaluation_results/
+comparison_results/
 *.png
 training_history.png
 predictions.png
